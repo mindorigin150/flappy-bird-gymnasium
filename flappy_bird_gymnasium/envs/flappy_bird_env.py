@@ -56,6 +56,7 @@ from flappy_bird_gymnasium.envs.constants import (
     PLAYER_WIDTH,
 )
 from flappy_bird_gymnasium.envs.lidar import LIDAR
+from flappy_bird_gymnasium.envs.render_state import FlappyRenderState
 
 
 class Actions(IntEnum):
@@ -405,6 +406,38 @@ class FlappyBirdEnv(gymnasium.Env):
 
             self._update_display()
             self._fps_clock.tick(self.metadata["render_fps"])
+
+    def get_render_state(self) -> FlappyRenderState:
+        """Returns the render-only state for the current frame.
+
+        The snapshot matches the ``rgb_array`` renderer surface before score and
+        lidar overlays are drawn.  It deliberately exposes only drawing inputs;
+        physics, rewards, pipe generation, and collision logic remain owned by
+        the environment.
+        """
+        visible_rot = PLAYER_ROT_THR
+        if self._player_rot <= PLAYER_ROT_THR:
+            visible_rot = self._player_rot
+
+        return FlappyRenderState(
+            player_x=float(self._player_x),
+            player_y=float(self._player_y),
+            player_index=int(self._player_idx),
+            visible_rotation=int(visible_rot),
+            upper_pipes=tuple(
+                (float(pipe["x"]), float(pipe["y"])) for pipe in self._upper_pipes
+            ),
+            lower_pipes=tuple(
+                (float(pipe["x"]), float(pipe["y"])) for pipe in self._lower_pipes
+            ),
+            ground_x=float(self._ground["x"]),
+            ground_y=float(self._ground["y"]),
+            screen_width=int(self._screen_width),
+            screen_height=int(self._screen_height),
+            bird_color=self._bird_color,
+            pipe_color=self._pipe_color,
+            background=self._bg_type,
+        )
 
     def close(self):
         """Closes the environment."""
