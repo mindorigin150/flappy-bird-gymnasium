@@ -86,6 +86,7 @@ class TorchFlappyRenderer:
         self._birds: Dict[Tuple[int, int], TorchSprite] = {
             key: self._to_torch_sprite(sprite) for key, sprite in assets.birds.items()
         }
+        self.device = self._fill_color.device
         self._direct_background_cache: Dict[int, torch.Tensor] = {}
         self._direct_sprite_cache: Dict[Tuple[str, int, int], DirectTorchSprite] = {}
         self._direct_grid_cache: Dict[
@@ -112,6 +113,58 @@ class TorchFlappyRenderer:
         Returns:
             Tensor shaped ``(batch, screen_height, screen_width, 3)``.
         """
+
+        batch = self._batch(states)
+        return self._render_batch(batch)
+
+    def render_into(self, states: StateLike, out: torch.Tensor) -> torch.Tensor:
+        """Renders full-size frames into a caller-provided NHWC uint8 tensor."""
+
+        batch = self._batch(states)
+        return self._render_batch(batch, out=out)
+
+    def _render_batch(
+        self,
+        batch: BatchedFlappyRenderState,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        self._validate_assets(batch)
+        frame = self._background_frame(batch, out=out)
+
+        for pipe_idx in range(batch.pipe_count):
+            self._blit_batch_uint8(
+                frame,
+                self._pipe_upper,
+                batch.upper_pipe_xy[:, pipe_idx],
+            )
+            self._blit_batch_uint8(
+                frame,
+                self._pipe_lower,
+                batch.lower_pipe_xy[:, pipe_idx],
+            )
+
+        self._blit_batch_uint8(frame, self._base, batch.ground_xy)
+
+        player_indices = batch.player_indices.astype(np.int64, copy=False)
+        rotations = batch.visible_rotations.astype(np.int64, copy=False)
+        for player_index, rotation in sorted(set(zip(player_indices, rotations))):
+            env_indices = np.flatnonzero(
+                (batch.player_indices == player_index)
+                & (batch.visible_rotations == rotation)
+            )
+            if env_indices.size == 0:
+                continue
+            self._blit_batch_uint8(
+                frame,
+                self._birds[(int(player_index), int(rotation))],
+                batch.player_xy[env_indices],
+                frame_indices=env_indices,
+            )
+
+        return frame
+
+    def _render_scalar(self, states: StateLike) -> torch.Tensor:
+        """Reference full-size renderer retained for parity tests."""
 
         batch = self._batch(states)
         self._validate_assets(batch)
@@ -370,20 +423,55 @@ class TorchFlappyRenderer:
                 f"state background={batch.background!r}"
             )
 
-    def _background_frame(self, batch: BatchedFlappyRenderState) -> torch.Tensor:
+    def _background_frame(
+        self,
+        batch: BatchedFlappyRenderState,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         height = int(batch.screen_height)
         width = int(batch.screen_width)
+        if out is not None:
+            self._validate_output_buffer(out, batch)
+            frame = out
+        else:
+            frame = None
+
         if self._background is None:
-            frame = torch.empty(
-                (batch.batch_size, height, width, 3),
-                dtype=torch.uint8,
-                device=self.device,
-            )
+            if frame is None:
+                frame = torch.empty(
+                    (batch.batch_size, height, width, 3),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
             frame[:, :, :, :] = self._fill_color
             return frame
 
         bg = self._background[:height, :width]
-        return bg.unsqueeze(0).expand(batch.batch_size, -1, -1, -1).clone()
+        expanded = bg.unsqueeze(0).expand(batch.batch_size, -1, -1, -1)
+        if frame is None:
+            return expanded.clone()
+        frame.copy_(expanded)
+        return frame
+
+    def _validate_output_buffer(
+        self,
+        out: torch.Tensor,
+        batch: BatchedFlappyRenderState,
+    ) -> None:
+        if not isinstance(out, torch.Tensor):
+            raise TypeError("out must be a torch.Tensor")
+        expected_shape = (
+            int(batch.batch_size),
+            int(batch.screen_height),
+            int(batch.screen_width),
+            3,
+        )
+        if tuple(out.shape) != expected_shape:
+            raise ValueError(f"out must have shape {expected_shape}")
+        if out.dtype != torch.uint8:
+            raise ValueError("out must have dtype torch.uint8")
+        if out.device != self.device:
+            raise ValueError(f"out must be on renderer device {self.device}")
 
     def _direct_background_frame(
         self,
@@ -428,6 +516,70 @@ class TorchFlappyRenderer:
         src_mask = sprite.mask[src_y0 : src_y0 + height, src_x0 : src_x0 + width]
         patch = dst[dst_y0 : dst_y0 + height, dst_x0 : dst_x0 + width]
         patch[src_mask] = src_rgb[src_mask]
+
+    def _blit_batch_uint8(
+        self,
+        dst: torch.Tensor,
+        sprite: TorchSprite,
+        source_xy: np.ndarray,
+        frame_indices: Optional[np.ndarray] = None,
+    ) -> None:
+        positions = np.asarray(source_xy)
+        if positions.size == 0:
+            return
+        positions = positions.reshape(-1, 2)
+        if frame_indices is None:
+            frame_indices_np = np.arange(positions.shape[0], dtype=np.int64)
+        else:
+            frame_indices_np = np.asarray(frame_indices, dtype=np.int64)
+        if frame_indices_np.size != positions.shape[0]:
+            raise ValueError("frame_indices must match source_xy length")
+
+        x = positions[:, 0].astype(np.int64, copy=False)
+        y = positions[:, 1].astype(np.int64, copy=False)
+
+        dst_h = int(dst.shape[1])
+        dst_w = int(dst.shape[2])
+        src_x0 = np.maximum(0, -x)
+        src_y0 = np.maximum(0, -y)
+        dst_x0 = np.maximum(0, x)
+        dst_y0 = np.maximum(0, y)
+        clipped_width = np.minimum(sprite.width - src_x0, dst_w - dst_x0)
+        clipped_height = np.minimum(sprite.height - src_y0, dst_h - dst_y0)
+        visible = (clipped_width > 0) & (clipped_height > 0)
+        if not bool(np.any(visible)):
+            return
+
+        frame_indices_np = frame_indices_np[visible]
+        x = x[visible]
+        y = y[visible]
+
+        n = int(frame_indices_np.shape[0])
+        grid_y, grid_x = self._direct_sprite_grid(sprite.height, sprite.width)
+        grid_y = grid_y.unsqueeze(0).expand(n, -1, -1)
+        grid_x = grid_x.unsqueeze(0).expand(n, -1, -1)
+
+        x_t = torch.as_tensor(x, dtype=torch.long, device=self.device).view(n, 1, 1)
+        y_t = torch.as_tensor(y, dtype=torch.long, device=self.device).view(n, 1, 1)
+        dst_x = x_t + grid_x
+        dst_y = y_t + grid_y
+        in_bounds = (
+            (dst_x >= 0)
+            & (dst_x < dst_w)
+            & (dst_y >= 0)
+            & (dst_y < dst_h)
+        )
+        src_mask = sprite.mask.unsqueeze(0).expand(n, -1, -1)
+        write_mask = in_bounds & src_mask
+
+        env_t = torch.as_tensor(
+            frame_indices_np, dtype=torch.long, device=self.device
+        ).view(n, 1, 1)
+        env_idx = env_t.expand_as(write_mask)[write_mask]
+        dst_y_idx = dst_y[write_mask]
+        dst_x_idx = dst_x[write_mask]
+        src_rgb = sprite.rgb.unsqueeze(0).expand(n, -1, -1, -1)[write_mask]
+        dst[env_idx, dst_y_idx, dst_x_idx] = src_rgb
 
     def _scaled_sprite(
         self,
