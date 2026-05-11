@@ -88,6 +88,9 @@ class TorchFlappyRenderer:
         }
         self.device = self._fill_color.device
         self._direct_background_cache: Dict[int, torch.Tensor] = {}
+        self._background_batch_cache: Dict[Tuple[int, int, int], torch.Tensor] = {}
+        self._np_frame_indices_cache: Dict[int, np.ndarray] = {}
+        self._blit_index_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._direct_sprite_cache: Dict[Tuple[str, int, int], DirectTorchSprite] = {}
         self._direct_grid_cache: Dict[
             Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]
@@ -446,12 +449,21 @@ class TorchFlappyRenderer:
             frame[:, :, :, :] = self._fill_color
             return frame
 
-        bg = self._background[:height, :width]
-        expanded = bg.unsqueeze(0).expand(batch.batch_size, -1, -1, -1)
+        expanded = self._background_batch(batch.batch_size, height, width)
         if frame is None:
             return expanded.clone()
         frame.copy_(expanded)
         return frame
+
+    def _background_batch(self, batch_size: int, height: int, width: int) -> torch.Tensor:
+        key = (int(batch_size), int(height), int(width))
+        cached = self._background_batch_cache.get(key)
+        if cached is not None:
+            return cached
+        bg = self._background[:height, :width]
+        cached = bg.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous()
+        self._background_batch_cache[key] = cached
+        return cached
 
     def _validate_output_buffer(
         self,
@@ -529,7 +541,7 @@ class TorchFlappyRenderer:
             return
         positions = positions.reshape(-1, 2)
         if frame_indices is None:
-            frame_indices_np = np.arange(positions.shape[0], dtype=np.int64)
+            frame_indices_np = self._np_frame_indices(int(positions.shape[0]))
         else:
             frame_indices_np = np.asarray(frame_indices, dtype=np.int64)
         if frame_indices_np.size != positions.shape[0]:
@@ -559,8 +571,9 @@ class TorchFlappyRenderer:
         grid_y = grid_y.unsqueeze(0).expand(n, -1, -1)
         grid_x = grid_x.unsqueeze(0).expand(n, -1, -1)
 
-        x_t = torch.as_tensor(x, dtype=torch.long, device=self.device).view(n, 1, 1)
-        y_t = torch.as_tensor(y, dtype=torch.long, device=self.device).view(n, 1, 1)
+        x_t, y_t, env_t = self._blit_index_buffers(n)
+        x_t.copy_(torch.as_tensor(x, dtype=torch.long).view(n, 1, 1), non_blocking=True)
+        y_t.copy_(torch.as_tensor(y, dtype=torch.long).view(n, 1, 1), non_blocking=True)
         dst_x = x_t + grid_x
         dst_y = y_t + grid_y
         in_bounds = (
@@ -572,14 +585,33 @@ class TorchFlappyRenderer:
         src_mask = sprite.mask.unsqueeze(0).expand(n, -1, -1)
         write_mask = in_bounds & src_mask
 
-        env_t = torch.as_tensor(
-            frame_indices_np, dtype=torch.long, device=self.device
-        ).view(n, 1, 1)
+        env_t.copy_(torch.as_tensor(frame_indices_np, dtype=torch.long).view(n, 1, 1), non_blocking=True)
         env_idx = env_t.expand_as(write_mask)[write_mask]
         dst_y_idx = dst_y[write_mask]
         dst_x_idx = dst_x[write_mask]
         src_rgb = sprite.rgb.unsqueeze(0).expand(n, -1, -1, -1)[write_mask]
         dst[env_idx, dst_y_idx, dst_x_idx] = src_rgb
+
+    def _np_frame_indices(self, n: int) -> np.ndarray:
+        cached = self._np_frame_indices_cache.get(int(n))
+        if cached is not None:
+            return cached
+        indices = np.arange(int(n), dtype=np.int64)
+        self._np_frame_indices_cache[int(n)] = indices
+        return indices
+
+    def _blit_index_buffers(self, n: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cached = self._blit_index_cache.get(int(n))
+        if cached is not None:
+            return cached
+        shape = (int(n), 1, 1)
+        buffers = (
+            torch.empty(shape, dtype=torch.long, device=self.device),
+            torch.empty(shape, dtype=torch.long, device=self.device),
+            torch.empty(shape, dtype=torch.long, device=self.device),
+        )
+        self._blit_index_cache[int(n)] = buffers
+        return buffers
 
     def _scaled_sprite(
         self,
