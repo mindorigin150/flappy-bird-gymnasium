@@ -30,7 +30,7 @@ class BatchedFlappyStepResult:
     rewards: np.ndarray
     terminated: np.ndarray
     truncated: np.ndarray
-    infos: list[dict[str, Any]]
+    scores: np.ndarray
 
 
 class BatchedFlappyBirdCore:
@@ -152,13 +152,12 @@ class BatchedFlappyBirdCore:
 
         rewards[~active] = 0.0
         observations = self._observations()
-        infos = [{"score": int(self.score[agent_idx])} for agent_idx in range(self.batch_size)]
         return BatchedFlappyStepResult(
             observations=observations,
             rewards=rewards,
             terminated=terminated,
             truncated=truncated,
-            infos=infos,
+            scores=self.score.copy(),
         )
 
     def render_state_batch(self) -> BatchedFlappyRenderState:
