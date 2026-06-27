@@ -40,6 +40,7 @@ short_description = "A Gymnasium environment for the Flappy Bird game."
 REQUIRED_PACKAGES = [
     "gymnasium",
     "numpy",
+    "pillow",
     "pygame",
     "matplotlib",
 ]

@@ -34,7 +34,9 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from PIL import Image as _PILImage
 from pygame import Rect
+from pygame import error as pyg_error
 from pygame import image as pyg_image
 from pygame import mixer as pyg_mixer
 from pygame.transform import flip as img_flip
@@ -76,7 +78,17 @@ def get_hitmask(image) -> List[List[bool]]:
 
 
 def _load_sprite(filename, convert, alpha=True):
-    img = pyg_image.load(f"{SPRITES_PATH}/{filename}")
+    path = f"{SPRITES_PATH}/{filename}"
+    try:
+        img = pyg_image.load(path)
+    except pyg_error:
+        # Heavy multi-lib hosts (PyAV/OpenCV/Pillow/torchvision + pygame's
+        # SDL2_image each vendor an incompatible libpng16) interpose SDL2_image's
+        # png_* symbols and fail to decode our sprites. Decode via Pillow instead
+        # — pixel-identical, no LD_PRELOAD needed.
+        mode = "RGBA" if alpha else "RGB"
+        pil = _PILImage.open(path).convert(mode)
+        img = pyg_image.fromstring(pil.tobytes(), pil.size, mode)
     return (
         img.convert_alpha() if convert and alpha else img.convert() if convert else img
     )
